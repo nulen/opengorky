@@ -11,6 +11,7 @@ const object = @import("../script.zig").object;
 const Object = object.Object;
 const Value = @import("../script.zig").value.Value;
 const Runtime = @import("../script.zig").runtime.Runtime;
+const names_classic = @import("../script.zig").classic.names;
 const fields = @import("../fields.zig");
 const inventory = @import("../inventory.zig");
 
@@ -42,7 +43,9 @@ pub fn restore(w: *World, o: *Object, vars: []const VarCopy, skills: []const sta
 /// those it has.
 fn restoreVars(rt: *Runtime, here: []const u8, o: *Object, vars: []const VarCopy) Allocator.Error!void {
     for (vars) |v| {
-        const dst = o.getVarDyn(v.name) orelse continue;
+        // Saves of the engine before the OG Script names spell a field as the exe does
+        // (`nameid`, `spritefile`, a weapon's `type`): the engine's name by the host.
+        const dst = o.getVarDyn(v.name) orelse o.getVarDyn(names_classic.engine(o.class.host, v.name)) orelse continue;
         dst.value = try attach(rt, rt.arena(), v.value, here);
     }
 }
@@ -335,4 +338,33 @@ test "component instances' vars and subscriptions outlive their world by names (
     try std.testing.expectEqual(h2, Object.of(p2.getVar("who").?.value.ref));
     try std.testing.expectEqual(1, try rt.emit("ping", &.{}));
     try std.testing.expectEqual(103, p2.getInt("n"));
+}
+
+test "a save of the engine before the OG Script names restores the fields it spells as the exe does" {
+    const Src = struct {
+        fn fetch(_: *anyopaque, _: []const u8) anyerror!?[]const u8 {
+            return null;
+        }
+    };
+    const gpa = std.testing.allocator;
+    var ctx: u8 = 0;
+    var rt: Runtime = .init(gpa, .{ .ctx = &ctx, .fetch = Src.fetch });
+    defer rt.deinit();
+    const cls = try rt.arena().create(object.Class);
+    cls.* = .{ .name = "gun.s", .parent = null, .host = .weapon };
+    const gun = try rt.createObject("gun", cls);
+    for ([_][]const u8{ "classic_id", "icon", "damage_kind" }) |n| try gun.declare(rt.arena(), n, .{ .type = .int, .value = .{ .int = 0 } });
+    // v0.2.0 wrote the names of classes\weapon.s and item.s.
+    try restoreVars(&rt, "01_port", gun, &.{
+        .{ .name = "nameID", .value = .{ .int = 7 } },
+        .{ .name = "spritefile", .value = .{ .int = 3 } },
+        .{ .name = "type", .value = .{ .int = 2 } },
+        .{ .name = "gone", .value = .{ .int = 9 } },
+    });
+    try std.testing.expectEqual(7, gun.getInt("classic_id"));
+    try std.testing.expectEqual(3, gun.getInt("icon"));
+    try std.testing.expectEqual(2, gun.getInt("damage_kind"));
+    // The engine's own name wins over the exe's.
+    try restoreVars(&rt, "01_port", gun, &.{.{ .name = "classic_id", .value = .{ .int = 8 } }});
+    try std.testing.expectEqual(8, gun.getInt("classic_id"));
 }

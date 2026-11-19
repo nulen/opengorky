@@ -6,11 +6,14 @@ const fields = @import("../fields.zig");
 const world_mod = @import("../state.zig").world;
 const World = world_mod.World;
 const WorldState = @import("../world.zig").saved.WorldState;
+const SavedObj = @import("../world.zig").saved.Save.Obj;
 const snapshot = @import("../world.zig").snapshot;
 const sources = @import("../world.zig").sources;
 const start = @import("../world.zig").start;
 const walk = @import("../world.zig").walk;
 const inventory = @import("../inventory.zig");
+const names_classic = @import("../script.zig").classic.names;
+const Value = @import("../script.zig").value.Value;
 
 pub fn apply(ws: *const WorldState, w: *World) !void {
     const ra = w.rt.arena();
@@ -66,9 +69,10 @@ pub fn apply(ws: *const WorldState, w: *World) !void {
         if ((e.kind == .item or e.kind == .weapon) and e.anim.len > 0) n.actor.holdLast(try ra.dupe(u8, e.anim), e.anim_reverse);
     }
     // Vars once every object is there: a reference finds one made again further on.
+    const lost = lostRenamedFields(ws);
     for (ws.objects) |e| {
         const o = w.rt.findObject(e.name) orelse continue;
-        try snapshot.restore(w, o, e.vars, e.skills, e.stat_points);
+        if (lost) try repairLost(w, o, e) else try snapshot.restore(w, o, e.vars, e.skills, e.stat_points);
         // Its components' (an instance its host lacks now, the code changed: its values go).
         try snapshot.restoreComps(&w.rt, w.level_name, o, e.comps, "save");
     }
@@ -108,6 +112,57 @@ pub fn apply(ws: *const WorldState, w: *World) !void {
     for ([_]bool{ false, true }) |allow| for (ws.walk) |wa| if (wa.allow == allow) try walk.setWalkInArea(w, wa.name, allow, wa.floor);
     // The party is the save's.
     try @import("../world.zig").party.syncRoles(w);
+}
+
+/// A save the engine wrote after loading one of an engine before the OG Script names
+/// without reading the fields the exe spells otherwise (`nameid`, `spritefile`, a weapon's
+/// `type`; world/snapshot.zig restoreVars before it knew them): a weapon or item somebody
+/// carries has classic_id 0 there ("Nie zdefiniowano", no icon, no mesh). Items always
+/// have a name, so one such is the trace.
+fn lostRenamedFields(ws: *const WorldState) bool {
+    for (ws.objects) |e| {
+        if (e.kind != .item and e.kind != .weapon) continue;
+        const id = savedVar(e, "classic_id") orelse continue;
+        const owner = savedVar(e, "owner") orelse continue;
+        if (id == .int and id.int == 0 and owner == .string and owner.string.len > 0) return true;
+    }
+    return false;
+}
+
+/// `restore` for a world with `lostRenamedFields`: every field the engine renamed that the
+/// save has at its default (0, "", false) keeps the value the object has before the save's
+/// (the level made it, or a weapon or item made again from its class gets its class_init,
+/// as Item_New gives it); a hero of the party (the save's hero flag) left out of battles
+/// by the lost `avoidEnumerate` is in again.
+fn repairLost(w: *World, o: *@import("../script.zig").object.Object, e: SavedObj) !void {
+    const n = World.nativeOf(o);
+    if ((e.kind == .item or e.kind == .weapon) and o.getInt("classic_id") == 0) _ = try w.rt.callIfExists(o, "class_init", &.{});
+    var keep: std.ArrayList(snapshot.VarCopy) = .empty;
+    defer keep.deinit(w.gpa);
+    for (e.vars) |v| {
+        if (!isDefault(v.value) or std.mem.eql(u8, names_classic.classic(o.class.host, v.name), v.name)) continue;
+        const cur = o.getVarDyn(v.name) orelse continue;
+        if (!isDefault(cur.value)) try keep.append(w.gpa, .{ .name = v.name, .value = cur.value });
+    }
+    try snapshot.restore(w, o, e.vars, e.skills, e.stat_points);
+    for (keep.items) |k| o.getVarDyn(k.name).?.value = k.value;
+    if (e.hero and n.kind == .actor and o.getInt("outside_party") == 1) o.setInt("outside_party", 0);
+}
+
+fn savedVar(e: SavedObj, name: []const u8) ?Value {
+    for (e.vars) |v| if (std.ascii.eqlIgnoreCase(v.name, name)) return v.value;
+    return null;
+}
+
+fn isDefault(v: Value) bool {
+    return switch (v) {
+        .int => |x| x == 0,
+        .float => |x| x == 0,
+        .string => |s| s.len == 0,
+        .bool => |b| !b,
+        .nil => true,
+        else => false,
+    };
 }
 
 /// Repairs saves made before disabled objects got post_init: a hero who joined on his own
